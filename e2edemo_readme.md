@@ -73,30 +73,174 @@ Workspace: [`fevm-cmegdemos`](https://fevm-cmegdemos.cloud.databricks.com)
 - **Mode:** serverless
 - **Source:** Databricks Asset Bundle at `network_analytics_pipeline/` ([databricks.yml](network_analytics_pipeline/databricks.yml))
 
+**Expectation severity legend** — `@dp.expect` (warn-only, row kept), `@dp.expect_or_drop` (violating rows dropped), `@dp.expect_or_fail` (whole update aborts).
+
 ### 3.1 Bronze — raw schema-typed
 
-| Table | Source notebook | Source file | Expectations |
-| --- | --- | --- | --- |
-| [`bronze_fcc_bdc_h3`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_fcc_bdc_h3) | [bronze_fcc_bdc_h3.py](network_analytics_pipeline/src/bronze/bronze_fcc_bdc_h3.py) | `bdc_53_5GNR_mobile_broadband_h3_J25_14apr2026.zip` (GeoPackage) | `valid_fid` · `parsable_h3` (drop) · `known_technology` |
-| [`bronze_building_footprints`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_building_footprints) | [bronze_building_footprints.py](network_analytics_pipeline/src/bronze/bronze_building_footprints.py) | `Washington.zip` (Shapefile) | `wkt_present` (drop) · `polygon_format` (drop) · `non_negative_height` |
-| [`bronze_cell_towers`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_cell_towers) | [bronze_cell_towers.py](network_analytics_pipeline/src/bronze/bronze_cell_towers.py) | `310.csv.gz` (OpenCellID) | `non_null_cell` (drop) · `valid_mcc_310` (drop) · `valid_lat_lon` (drop) |
+#### [`bronze_fcc_bdc_h3`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_fcc_bdc_h3)
+Source: `bdc_53_5GNR_mobile_broadband_h3_J25_14apr2026.zip` (GeoPackage) — [bronze_fcc_bdc_h3.py](network_analytics_pipeline/src/bronze/bronze_fcc_bdc_h3.py)
+
+```python
+@dp.expect("valid_fid", "fid IS NOT NULL")
+```
+The FCC's internal feature ID should always be present. Warn-only because a missing fid is suspicious but doesn't break joins (we join on `h3_res9_id`).
+
+```python
+@dp.expect_or_drop("parsable_h3", "h3_isvalid(h3_res9_id)")
+```
+The H3 ID is the join key for everything downstream. If `h3_isvalid` returns false the row is unusable — drop it so silver/gold don't carry corrupt hex IDs.
+
+```python
+@dp.expect("known_technology", "technology IS NOT NULL")
+```
+Every BDC row should declare a technology code (3G/4G/5G). Warn-only — we filter by code in silver, so a NULL would just be excluded there anyway.
+
+#### [`bronze_building_footprints`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_building_footprints)
+Source: `Washington.zip` (ESRI Shapefile) — [bronze_building_footprints.py](network_analytics_pipeline/src/bronze/bronze_building_footprints.py)
+
+```python
+@dp.expect_or_drop("wkt_present", "wkt IS NOT NULL")
+```
+The whole point of this table is the geometry. A row without WKT has nothing to contribute — drop.
+
+```python
+@dp.expect_or_drop("polygon_format", "wkt LIKE 'POLYGON%'")
+```
+Microsoft footprints should always be polygons. If a row comes in as a LINESTRING or POINT, the shapefile got mangled — drop rather than risk a downstream `ST_Centroid` on a non-polygon.
+
+```python
+@dp.expect("non_negative_height", "height IS NULL OR height >= 0")
+```
+Negative building height is nonsensical but rare and might be a sentinel for "unknown." Warn-only so the metric surfaces if a bad batch lands.
+
+#### [`bronze_cell_towers`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_cell_towers)
+Source: `310.csv.gz` (OpenCellID, US-only) — [bronze_cell_towers.py](network_analytics_pipeline/src/bronze/bronze_cell_towers.py)
+
+```python
+@dp.expect_or_drop("non_null_cell", "cell IS NOT NULL")
+```
+Cell ID is the primary identifier for a tower's sector. No cell ID = the row can't be deduplicated or joined — drop.
+
+```python
+@dp.expect_or_drop("valid_mcc_310", "mcc = 310")
+```
+The CSV is supposed to be US-only (Mobile Country Code 310). If an MCC=302 (Canada) row leaks in, drop it before downstream silver assumes US bbox checks make sense.
+
+```python
+@dp.expect_or_drop("valid_lat_lon", "lat BETWEEN -90 AND 90 AND lon BETWEEN -180 AND 180")
+```
+Out-of-range coordinates would crash later spatial functions. Drop them at the source.
 
 ### 3.2 Silver — Seattle bbox, GEOMETRY(4326), carrier filter
 
-| Table | Source notebook | Expectations |
-| --- | --- | --- |
-| [`silver_fcc_bdc_h3_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_fcc_bdc_h3_seattle) | [silver_fcc_bdc_h3_seattle.py](network_analytics_pipeline/src/silver/silver_fcc_bdc_h3_seattle.py) | `in_seattle_bbox` (drop) · `known_5g_technology` · `non_null_speeds` |
-| [`silver_building_footprints_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_building_footprints_seattle) | [silver_building_footprints_seattle.py](network_analytics_pipeline/src/silver/silver_building_footprints_seattle.py) | `valid_geometry` (drop) · `centroid_in_seattle_bbox` (drop) · `non_negative_height` |
-| [`silver_tmobile_towers_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_tmobile_towers_seattle) | [silver_tmobile_towers_seattle.py](network_analytics_pipeline/src/silver/silver_tmobile_towers_seattle.py) | `tmobile_only` (**fail** if violated) · `point_geometry` (**fail**) · `in_seattle_bbox` (drop) · `radius_positive` |
+#### [`silver_fcc_bdc_h3_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_fcc_bdc_h3_seattle)
+[silver_fcc_bdc_h3_seattle.py](network_analytics_pipeline/src/silver/silver_fcc_bdc_h3_seattle.py)
+
+```python
+@dp.expect_or_drop("in_seattle_bbox",
+    "center_lat BETWEEN ... AND center_lon BETWEEN ...")
+```
+Bronze covers all of Washington state. Silver is the Seattle metro slice. Hexes whose center falls outside the bbox are dropped — they'd just be noise for the building-coverage analysis.
+
+```python
+@dp.expect("known_5g_technology", "technology IS NOT NULL")
+```
+Mirror of the bronze rule, kept as a warning here so the silver-layer metrics flag any rows that slipped through with NULL technology.
+
+```python
+@dp.expect("non_null_speeds", "mindown IS NOT NULL AND minup IS NOT NULL")
+```
+A row with NULL speeds is technically valid BDC but useless for coverage analysis. Warn so we can see the drop rate over time without aggressively removing rows.
+
+#### [`silver_building_footprints_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_building_footprints_seattle)
+[silver_building_footprints_seattle.py](network_analytics_pipeline/src/silver/silver_building_footprints_seattle.py)
+
+```python
+@dp.expect_or_drop("valid_geometry", "ST_IsValid(geometry)")
+```
+Bronze stored WKT strings; silver promotes them to native `GEOMETRY(4326)`. If the parsed geometry is self-intersecting or otherwise invalid, drop — every downstream `ST_*` call would error.
+
+```python
+@dp.expect_or_drop("centroid_in_seattle_bbox", "ST_Y(ST_Centroid(geometry)) BETWEEN ...")
+```
+Filter the WA-state buildings down to Seattle metro. Centroid-based: a building straddling the bbox edge is included if its center is inside.
+
+```python
+@dp.expect("non_negative_height", "height IS NULL OR height >= 0")
+```
+Same warn-only check as bronze — repeated here so silver metrics show the violation rate even after dropping out-of-bbox rows.
+
+#### [`silver_tmobile_towers_seattle`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/silver_tmobile_towers_seattle)
+[silver_tmobile_towers_seattle.py](network_analytics_pipeline/src/silver/silver_tmobile_towers_seattle.py)
+
+```python
+@dp.expect_or_fail("tmobile_only", f"net = {TMOBILE_MNC}")
+```
+If a non-T-Mobile tower somehow shows up here, the entire update fails. That's correct — you'd rather stop and figure out why a Verizon tower got in than silently produce a corrupted "T-Mobile coverage" gold table.
+
+```python
+@dp.expect_or_fail("point_geometry", "ST_GeometryType(location) = 'ST_Point'")
+```
+Towers must be points, not polygons or linestrings. The downstream haversine logic assumes a single (lat, lon) pair — fail loudly if the schema breaks.
+
+```python
+@dp.expect_or_drop("in_seattle_bbox", "latitude BETWEEN ... AND longitude BETWEEN ...")
+```
+Bronze is US-wide. Drop towers outside Seattle metro so the cross-join in gold stays cheap.
+
+```python
+@dp.expect("radius_positive", "coverage_radius_m IS NULL OR coverage_radius_m > 0")
+```
+A zero or negative radius is suspicious but tolerable since we don't currently use radius for matching. Warn so we'd notice if it becomes systematic.
 
 ### 3.3 Gold — analysis-ready
 
-| Table | Source notebook | Expectations |
-| --- | --- | --- |
-| [`gold_downtown_building_coverage`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/gold_downtown_building_coverage) | [gold_downtown_building_coverage.py](network_analytics_pipeline/src/gold/gold_downtown_building_coverage.py) | `non_negative_speeds` (**fail**) · `reasonable_distance` 0–50 km (**fail**) · `valid_h3` (**fail**) · `has_nearest_tower` (drop) · `has_5g_coverage` |
-| [`gold_coverage_by_distance_bucket`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/gold_coverage_by_distance_bucket) | [gold_coverage_by_distance_bucket.py](network_analytics_pipeline/src/gold/gold_coverage_by_distance_bucket.py) | `bucket_has_buildings` (**fail**) · `non_negative_avg_speed` (**fail**) · `non_null_avg_speed` |
+#### [`gold_downtown_building_coverage`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/gold_downtown_building_coverage)
+[gold_downtown_building_coverage.py](network_analytics_pipeline/src/gold/gold_downtown_building_coverage.py)
 
-**Expectation severity legend** — `expect` (warn-only), `expect_or_drop` (drop violating rows), `expect_or_fail` (abort the update).
+```python
+@dp.expect_or_fail("non_negative_speeds",
+    "best_download_mbps >= 0 AND best_upload_mbps >= 0")
+```
+Negative throughput is impossible. If silver leaks one through, abort — this would be visible in customer-facing dashboards within minutes.
+
+```python
+@dp.expect_or_fail("reasonable_distance", "distance_to_tower_m BETWEEN 0 AND 50000")
+```
+The "nearest" tower should be within 50 km. A 5,000 km value means the haversine math broke (lat/lon swapped, projection mismatch). Fail rather than ship an obviously wrong column.
+
+```python
+@dp.expect_or_fail("valid_h3", "h3_isvalid(h3_res9_id)")
+```
+Same H3 sanity check as bronze, but here as a hard fail — the gold table is what dashboards and the Genie sit on top of, so a bad hex would silently corrupt every map.
+
+```python
+@dp.expect_or_drop("has_nearest_tower", "nearest_tower_id IS NOT NULL")
+```
+Buildings with no nearest-tower match (shouldn't happen with a CROSS JOIN, but defends against an empty `silver_tmobile_towers_seattle` upstream) are dropped — keeping them would muddle the distance-to-tower analysis.
+
+```python
+@dp.expect("has_5g_coverage", "best_download_mbps > 0")
+```
+Many downtown buildings have zero reported 5G coverage — that's actually a finding, not an error. Warn-only, so the metric tells us *what fraction* of buildings have no coverage filed.
+
+#### [`gold_coverage_by_distance_bucket`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/gold_coverage_by_distance_bucket)
+[gold_coverage_by_distance_bucket.py](network_analytics_pipeline/src/gold/gold_coverage_by_distance_bucket.py)
+
+```python
+@dp.expect_or_fail("bucket_has_buildings", "buildings > 0")
+```
+Each distance-bucket row aggregates over multiple buildings; a row with `buildings = 0` would mean a GROUP BY produced an empty group, which shouldn't be possible. Fail to surface the bug.
+
+```python
+@dp.expect_or_fail("non_negative_avg_speed", "avg_download_mbps >= 0")
+```
+Average of non-negative numbers can't be negative. If this fires, the underlying gold table had bad data — fail.
+
+```python
+@dp.expect("non_null_avg_speed", "avg_download_mbps IS NOT NULL")
+```
+A NULL average usually means an empty group survived the prior `expect_or_fail`. Warn-only as a defense in depth.
 
 ### 3.4 Reference notebooks (alternative imperative path)
 
