@@ -119,7 +119,7 @@ network_analytics_pipeline/
 ├── README.md                             # this file
 ├── AGENTS.md / CLAUDE.md                 # agent guidance
 ├── notebooks/
-│   └── demo_generate_cell_towers_shard.ipynb  # demo shards → FileStore → manual upload
+│   └── demo_generate_cell_towers_shard.ipynb  # demo shards → raw_data/cell_towers/
 ├── resources/
 │   └── network_analytics.pipeline.yml    # Pipeline resource (serverless)
 └── src/
@@ -181,7 +181,7 @@ The next update recreates `bronze_cell_towers` as a streaming table and refreshe
 - **What to drop:** Headerless gzip CSVs in the same 14-column layout as historical `310.csv.gz`. Any file name is fine; use dated prefixes (e.g. `2026-05-05_310.csv.gz`) or nested folders — `pathGlobFilter` is `*.csv.gz` with `recursiveFileLookup` enabled.
 - **Semantics:** Append-only incremental ingest: each pipeline update processes **new** files since the streaming checkpoint. Ad-hoc drops are picked up on the next run (pipeline `continuous: false` is fine).
 - **Implementation:** `@dp.table()` + `spark.readStream.format("cloudFiles")` — see [Auto Loader](https://docs.databricks.com/aws/en/ingestion/auto-loader/index) and [SDP](https://docs.databricks.com/aws/en/ldp). Downstream silver still batch-reads `bronze_cell_towers` with `spark.read.table(...)`.
-- **Demo notebook:** [notebooks/demo_generate_cell_towers_shard.ipynb](notebooks/demo_generate_cell_towers_shard.ipynb) — random sample gzip from `raw_data/310.csv.gz` → writes to **DBFS FileStore** for download; you upload manually to `cell_towers/`.
+- **Demo notebook:** [notebooks/demo_generate_cell_towers_shard.ipynb](notebooks/demo_generate_cell_towers_shard.ipynb) — random sample gzip from `raw_data/310.csv.gz` → writes into **`raw_data/cell_towers/`** for Auto Loader.
 
 ## Design notes
 
