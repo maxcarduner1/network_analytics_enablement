@@ -2,8 +2,8 @@
 
 For architecture rationale, Expectations as implemented, event-log queries, and operational troubleshooting, see [detailed_readme.md](detailed_readme.md).
 
-A **Lakeflow Spark Declarative Pipeline** (formerly DLT) packaged as a
-Declarative Automation Bundle (DAB). Converts the existing `01_Ingest.ipynb`
+A **Lakeflow Spark Declarative Pipeline** (**SDP**) packaged as a
+Declarative Automation Bundle (DAB). Official docs: [Lakeflow Spark Declarative Pipelines](https://docs.databricks.com/aws/en/ldp). Converts the existing `01_Ingest.ipynb`
 extraction logic and the `02_Analysis.ipynb` join logic into a production
 medallion pipeline with **Expectations highlighted at every layer** and a
 **visible DAG**.
@@ -15,13 +15,13 @@ flowchart LR
     subgraph raw [Raw — UC Volume cmegdemos_catalog.network_analytics_enablement.raw_data]
         Z1["bdc_53_5GNR...zip<br/><i>GeoPackage</i>"]
         Z2["Washington.zip<br/><i>Shapefile</i>"]
-        Z3["310.csv.gz<br/><i>OpenCellID</i>"]
+        Z3["cell_towers/<br/>*.csv.gz<br/><i>OpenCellID + Auto Loader</i>"]
     end
 
     subgraph bronze [Bronze — raw extracts, structural Expectations]
         B1["bronze_fcc_bdc_h3<br/>~14k WA hexes"]
         B2["bronze_building_footprints<br/>~442k WA bldgs"]
-        B3["bronze_cell_towers<br/>~5M USA towers"]
+        B3["bronze_cell_towers<br/><i>streaming Δ</i><br/>~5M USA towers"]
     end
 
     subgraph silver [Silver — typed, geometry, Seattle-scoped, business Expectations]
@@ -80,7 +80,7 @@ Three escalating severity levels per layer:
 | `silver_building_footprints_seattle` | `centroid_in_seattle_bbox` | drop |
 | `silver_building_footprints_seattle` | `non_negative_height` | warn |
 | `silver_tmobile_towers_seattle` | `tmobile_only: net = 260` | **fail** (sentinel) |
-| `silver_tmobile_towers_seattle` | `point_geometry: ST_GeometryType(location) = 'POINT'` | **fail** (sentinel) |
+| `silver_tmobile_towers_seattle` | `point_geometry: ST_GeometryType(location) = 'ST_Point'` | **fail** (sentinel) |
 | `silver_tmobile_towers_seattle` | `in_seattle_bbox` | drop |
 | `silver_tmobile_towers_seattle` | `radius_positive` | warn |
 
@@ -118,6 +118,8 @@ network_analytics_pipeline/
 ├── databricks.yml                        # DAB config (vars, targets dev/prod)
 ├── README.md                             # this file
 ├── AGENTS.md / CLAUDE.md                 # agent guidance
+├── notebooks/
+│   └── demo_generate_cell_towers_shard.ipynb  # demo shards → FileStore → manual upload
 ├── resources/
 │   └── network_analytics.pipeline.yml    # Pipeline resource (serverless)
 └── src/
@@ -144,7 +146,9 @@ All tables are published to `cmegdemos_catalog.network_analytics_enablement`
 
 Pre-requisites: Databricks CLI installed, a profile authenticated, and the
 volume `cmegdemos_catalog.network_analytics_enablement.raw_data` populated with
-the three source files.
+the FCC zip, `Washington.zip`, and **OpenCellID gzip CSV shards** under
+`raw_data/cell_towers/` (see below). Zips may remain at the volume root; tower
+CSVs use a dedicated subfolder for append-only Auto Loader ingestion.
 
 ```bash
 cd network_analytics_pipeline
@@ -162,13 +166,27 @@ databricks bundle run network_analytics_pipeline -t dev --profile fevm-cmegdemos
 The CLI prints the pipeline URL — open it to see the live DAG and the Data
 Quality tab.
 
+### Migration: `bronze_cell_towers` was a materialized view (older deploys)
+
+Lakeflow SDP **cannot** change an existing dataset from **materialized view** to **streaming table** in place. If deploy/run fails with **`CANNOT_CHANGE_DATASET_TYPE`** / *Cannot change the dataset type of a pipeline table from MATERIALIZED_VIEW to STREAMING_TABLE*:
+
+1. Run **`DROP TABLE`** on `bronze_cell_towers` in your target catalog/schema (see [scripts/drop_bronze_cell_towers_for_streaming_migration.sql](scripts/drop_bronze_cell_towers_for_streaming_migration.sql)). Adjust names if `catalog` / `schema` bundle variables differ.
+2. **`databricks bundle deploy`** again, then **`databricks bundle run network_analytics_pipeline`**.
+
+The next update recreates `bronze_cell_towers` as a streaming table and refreshes downstream nodes. Downstream tables (`silver_*`, `gold_*`) do not need to be dropped for this change.
+
+## OpenCellID bronze (`bronze_cell_towers`) — Auto Loader
+
+- **Where to land files:** `{raw_volume_path}/{cell_towers_incoming_subdir}/` (defaults to `.../raw_data/cell_towers/`). Configure `cell_towers_incoming_subdir` in [databricks.yml](databricks.yml) if you use a different folder name.
+- **What to drop:** Headerless gzip CSVs in the same 14-column layout as historical `310.csv.gz`. Any file name is fine; use dated prefixes (e.g. `2026-05-05_310.csv.gz`) or nested folders — `pathGlobFilter` is `*.csv.gz` with `recursiveFileLookup` enabled.
+- **Semantics:** Append-only incremental ingest: each pipeline update processes **new** files since the streaming checkpoint. Ad-hoc drops are picked up on the next run (pipeline `continuous: false` is fine).
+- **Implementation:** `@dp.table()` + `spark.readStream.format("cloudFiles")` — see [Auto Loader](https://docs.databricks.com/aws/en/ingestion/auto-loader/index) and [SDP](https://docs.databricks.com/aws/en/ldp). Downstream silver still batch-reads `bronze_cell_towers` with `spark.read.table(...)`.
+- **Demo notebook:** [notebooks/demo_generate_cell_towers_shard.ipynb](notebooks/demo_generate_cell_towers_shard.ipynb) — random sample gzip from `raw_data/310.csv.gz` → writes to **DBFS FileStore** for download; you upload manually to `cell_towers/`.
+
 ## Design notes
 
-- **All `@dp.materialized_view()` (batch)**: source files are static archives
-  in a Volume, not a continuous stream, and Auto Loader does not natively read
-  GeoPackage or Shapefile binaries. A Python MV that extracts the zip is the
-  cleanest 1:1 port of the existing notebook logic. On serverless, MVs get
-  automatic incremental refresh where the operation supports it.
+- **Mostly `@dp.materialized_view()` (batch)** for FCC and buildings: sources are static archives in a Volume, and Auto Loader does not natively read GeoPackage or Shapefile inside zips. A Python MV that extracts the zip is the cleanest 1:1 port of the existing notebook logic. On serverless, MVs get automatic incremental refresh where the operation supports it.
+- **`bronze_cell_towers` is a streaming table** so OpenCellID shards can land incrementally under `cell_towers/` without rescanning prior drops.
 - **Sentinel `expect_or_fail` checks**: the silver tower table filters on
   `net = 260` *and* asserts the same condition with `expect_or_fail`. The
   redundancy is intentional — if the upstream filter ever drifts, the contract

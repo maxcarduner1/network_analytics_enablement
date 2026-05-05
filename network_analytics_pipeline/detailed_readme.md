@@ -2,6 +2,8 @@
 
 This document expands on [README.md](README.md) with architecture rationale, layer-by-layer behavior, Expectations as implemented in code, operational runbooks, and known implementation details.
 
+**Platform:** [Lakeflow Spark Declarative Pipelines (SDP)](https://docs.databricks.com/aws/en/ldp).
+
 ## Purpose
 
 The bundle reproduces the intent of the repo notebooks:
@@ -20,13 +22,13 @@ flowchart LR
     subgraph raw [Raw_UC_Volume]
         Z1["bdc_53_5GNR...zip"]
         Z2["Washington.zip"]
-        Z3["310.csv.gz"]
+        Z3["cell_towers/*.csv.gz"]
     end
 
-    subgraph bronze [Bronze_MV]
-        B1["bronze_fcc_bdc_h3"]
-        B2["bronze_building_footprints"]
-        B3["bronze_cell_towers"]
+    subgraph bronze [Bronze]
+        B1["bronze_fcc_bdc_h3 (MV)"]
+        B2["bronze_building_footprints (MV)"]
+        B3["bronze_cell_towers (streaming)"]
     end
 
     subgraph silver [Silver_MV]
@@ -50,11 +52,13 @@ flowchart LR
 
 Override via bundle variable `raw_volume_path` in [databricks.yml](databricks.yml); the pipeline passes it to workers as Spark config `pipeline.raw_volume_path`, read in Bronze Python with `spark.conf.get(...)`.
 
+**OpenCellID incoming folder:** gzip CSV shards (append-only) must live under `{raw_volume_path}/{cell_towers_incoming_subdir}/` (default subdir `cell_towers`). Override with bundle variable `cell_towers_incoming_subdir` → `pipeline.cell_towers_incoming_subdir`.
+
 ## Dataset types and APIs
 
 - **Language:** Python only (Bronze must read GeoPackage via `sqlite3` and Shapefile via `pyshp`; Silver/Gold use Spark SQL).
-- **Dataset kind:** `@dp.materialized_view()` everywhere — sources are static files on a Volume (batch), not a continuous stream.
-- **Imports:** `from pyspark import pipelines as dp` (preferred over legacy `import dlt`).
+- **Dataset kind:** `@dp.materialized_view()` for FCC and buildings (batch extracts from zips). **`bronze_cell_towers`** is a **`@dp.table()` streaming table** fed by Auto Loader (`cloudFiles`) for append-only gzip CSV drops under `cell_towers/`.
+- **Imports:** `from pyspark import pipelines as dp` per [SDP development](https://docs.databricks.com/aws/en/ldp/developer); do not use the deprecated `dlt` Python package in new code.
 - **Cross-dataset reads:** `spark.read.table("upstream_name")` or unqualified names inside `spark.sql(...)` that resolve to pipeline-published datasets in the pipeline catalog/schema.
 
 ## Tables produced (logical model)
@@ -63,7 +67,7 @@ Override via bundle variable `raw_volume_path` in [databricks.yml](databricks.ym
 | --- | --- | --- |
 | Bronze | `bronze_fcc_bdc_h3` | All WA-state BDC H3 rows from GeoPackage (many rows per hex across providers/tech). |
 | Bronze | `bronze_building_footprints` | WA building polygons as WKT + height. |
-| Bronze | `bronze_cell_towers` | USA OpenCellID rows (MCC 310), typed columns. |
+| Bronze | `bronze_cell_towers` | USA OpenCellID rows (MCC 310), typed columns; Auto Loader incremental ingest from `*.csv.gz` under the configured incoming subfolder. |
 | Silver | `silver_fcc_bdc_h3_seattle` | Seattle bbox on H3 cell centers; adds `center_lat` / `center_lon`. |
 | Silver | `silver_building_footprints_seattle` | `GEOMETRY(4326)`, `building_id`, centroid-in-Seattle-bbox filter. |
 | Silver | `silver_tmobile_towers_seattle` | MNC 260, Seattle bbox, `ST_Point` as `location`. |
@@ -158,16 +162,21 @@ Dropped row counts on Silver reflect `expect_or_drop` on bbox and validity (ofte
 
 ## Bundle configuration
 
-- [databricks.yml](databricks.yml) — `bundle.name`, `include: resources/*.yml`, variables (`catalog`, `schema`, `raw_volume_path`), targets `dev` / `prod`.
-- [resources/network_analytics.pipeline.yml](resources/network_analytics.pipeline.yml) — `serverless: true`, `photon: true`, `libraries` glob for `../src/**`, `configuration` keys `pipeline.catalog`, `pipeline.schema`, `pipeline.raw_volume_path`, `environment.dependencies` (`pyshp`, `pandas`).
+- [databricks.yml](databricks.yml) — `bundle.name`, `include: resources/*.yml`, variables (`catalog`, `schema`, `raw_volume_path`, `cell_towers_incoming_subdir`), targets `dev` / `prod`.
+- [resources/network_analytics.pipeline.yml](resources/network_analytics.pipeline.yml) — `serverless: true`, `photon: true`, `libraries` glob for `../src/**`, `configuration` keys `pipeline.catalog`, `pipeline.schema`, `pipeline.raw_volume_path`, `pipeline.cell_towers_incoming_subdir`, `environment.dependencies` (`pyshp`, `pandas`).
 
 ## Operational runbook
+
+**`CANNOT_CHANGE_DATASET_TYPE` on `bronze_cell_towers`**
+
+If this table was ever deployed as a **materialized view** and the code now defines it as a **streaming table** (`@dp.table` + Auto Loader), SDP rejects the update until the old object is removed. Run `DROP TABLE` on `bronze_cell_towers` in the pipeline catalog/schema (template: [scripts/drop_bronze_cell_towers_for_streaming_migration.sql](scripts/drop_bronze_cell_towers_for_streaming_migration.sql)), then redeploy and run the pipeline.
 
 **Prerequisites**
 
 - Databricks CLI installed and authenticated (`databricks auth profiles` shows `Valid: YES` for your profile).
 - If `DATABRICKS_TOKEN` is set in the shell, it can override profile OAuth; unset it when debugging “invalid refresh token” while the profile is fresh.
-- Volume contains the three source files expected by Bronze (names are hard-coded in the Bronze modules).
+- Volume contains the FCC zip and `Washington.zip` at the paths expected by the two batch Bronze MVs.
+- OpenCellID: at least one headerless `*.csv.gz` under `{raw_volume_path}/{cell_towers_incoming_subdir}/` (default `.../raw_data/cell_towers/`). Additional dated files are ingested append-only on subsequent pipeline updates.
 
 **Standard loop**
 
@@ -206,6 +215,7 @@ Upgrading the Databricks CLI to a current release (see Databricks docs) removes 
 2. **Gold SQL and temp views:** Building `createOrReplaceTempView` in a pipeline MV and then querying those names in the same function can yield **zero output rows** in the pipeline runtime even when the same SQL works in a notebook. The shipped Gold MV uses **direct table names** (`silver_fcc_bdc_h3_seattle`, etc.) inside `spark.sql(...)`.
 3. **`monotonically_increasing_id`:** Silver `building_id` / `tower_id` are not stable keys across unrelated full rewrites of Bronze; for idempotent keys, consider hashing natural keys or ingesting source IDs.
 4. **Row counts:** Bronze FCC table row counts are **much larger** than unique H3 cells (multiple provider/technology rows per hex). Silver drops non-Seattle and invalid rows; event log `dropped_records` can be in the millions while the pipeline is healthy.
+5. **OpenCellID path change:** The bundle pipeline no longer reads `310.csv.gz` from the volume root. Copy or sync shards into `raw_data/cell_towers/` (or your configured `cell_towers_incoming_subdir`) before running the pipeline.
 
 ## File map
 
@@ -213,7 +223,7 @@ Upgrading the Databricks CLI to a current release (see Databricks docs) removes 
 | --- | --- |
 | [src/bronze/bronze_fcc_bdc_h3.py](src/bronze/bronze_fcc_bdc_h3.py) | Zip → GeoPackage → pandas → Spark; FCC expectations |
 | [src/bronze/bronze_building_footprints.py](src/bronze/bronze_building_footprints.py) | Zip → shapefile → WKT rows; footprint expectations |
-| [src/bronze/bronze_cell_towers.py](src/bronze/bronze_cell_towers.py) | Gzipped CSV via Spark; OpenCellID expectations |
+| [src/bronze/bronze_cell_towers.py](src/bronze/bronze_cell_towers.py) | Auto Loader (`cloudFiles`) streaming ingest of gzip CSV shards; OpenCellID expectations |
 | [src/silver/silver_fcc_bdc_h3_seattle.py](src/silver/silver_fcc_bdc_h3_seattle.py) | H3 center lat/lon + Seattle bbox |
 | [src/silver/silver_building_footprints_seattle.py](src/silver/silver_building_footprints_seattle.py) | WKT → `GEOMETRY(4326)` + bbox |
 | [src/silver/silver_tmobile_towers_seattle.py](src/silver/silver_tmobile_towers_seattle.py) | T-Mobile + `ST_Point` |

@@ -1,8 +1,10 @@
 """Bronze: raw OpenCellID cell-tower records for the USA (MCC=310).
 
-Reads the headerless gzipped CSV directly with Spark — no zip extraction needed.
-Casts numeric columns to typed forms but keeps the full USA row set; silver
-narrows to T-Mobile (MNC 260) inside the Seattle bbox and adds a POINT geometry.
+Ingests headerless gzipped CSV shards under ``<raw_volume_path>/<subdir>/`` using
+Auto Loader (`cloudFiles`). Append-only: new files (e.g. dated drops) are
+discovered on each pipeline update. Format matches the historical single-file
+`310.csv.gz` layout (14 columns). Silver narrows to T-Mobile (MNC 260) inside
+the Seattle bbox.
 """
 
 from pyspark import pipelines as dp
@@ -10,32 +12,17 @@ from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_unixtime
 from pyspark.sql.types import DoubleType, IntegerType, LongType
 
-CSV_NAME = "310.csv.gz"
-
-OPENCELLID_COLUMNS = [
-    "radio",
-    "mcc",
-    "net",
-    "area",
-    "cell",
-    "unit",
-    "lon",
-    "lat",
-    "range_m",
-    "samples",
-    "changeable",
-    "created",
-    "updated",
-    "avg_signal",
-]
+# Default subdir under `pipeline.raw_volume_path`; override via
+# `pipeline.cell_towers_incoming_subdir` in the bundle.
+INCOMING_SUBDIR_DEFAULT = "cell_towers"
 
 
-@dp.materialized_view(
+@dp.table(
     name="bronze_cell_towers",
     comment=(
-        "Raw OpenCellID cell-tower records for the USA (MCC 310). Read from a "
-        "gzipped CSV on a Unity Catalog Volume with native Spark IO; columns are "
-        "typed but no carrier or geographic filter is applied at this layer."
+        "Raw OpenCellID cell-tower records for the USA (MCC 310). Ingested with "
+        "Auto Loader from gzip CSV files under the configured incoming folder; "
+        "append-only incremental file discovery."
     ),
 )
 @dp.expect_or_drop("non_null_cell", "cell IS NOT NULL")
@@ -50,26 +37,35 @@ def bronze_cell_towers():
         "pipeline.raw_volume_path",
         "/Volumes/cmegdemos_catalog/network_analytics_enablement/raw_data",
     )
+    subdir = spark.conf.get(
+        "pipeline.cell_towers_incoming_subdir",
+        INCOMING_SUBDIR_DEFAULT,
+    )
+    incoming_path = f"{volume_path.rstrip('/')}/{subdir}"
 
     raw = (
-        spark.read.format("csv")
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "csv")
         .option("header", "false")
-        .load(f"{volume_path}/{CSV_NAME}")
-        .toDF(*OPENCELLID_COLUMNS)
+        .option("pathGlobFilter", "*.csv.gz")
+        .option("recursiveFileLookup", "true")
+        .load(incoming_path)
     )
 
+    # Headerless CSV → default column names _c0 .. _c13
     return raw.select(
-        col("radio"),
-        col("mcc").cast(IntegerType()).alias("mcc"),
-        col("net").cast(IntegerType()).alias("net"),
-        col("area").cast(IntegerType()).alias("area"),
-        col("cell").cast(LongType()).alias("cell"),
-        col("unit").cast(IntegerType()).alias("unit"),
-        col("lon").cast(DoubleType()).alias("lon"),
-        col("lat").cast(DoubleType()).alias("lat"),
-        col("range_m").cast(IntegerType()).alias("range_m"),
-        col("samples").cast(IntegerType()).alias("samples"),
-        from_unixtime(col("created").cast(LongType())).alias("created_ts"),
-        from_unixtime(col("updated").cast(LongType())).alias("updated_ts"),
-        col("avg_signal").cast(IntegerType()).alias("avg_signal"),
+        col("_c0").alias("radio"),
+        col("_c1").cast(IntegerType()).alias("mcc"),
+        col("_c2").cast(IntegerType()).alias("net"),
+        col("_c3").cast(IntegerType()).alias("area"),
+        col("_c4").cast(LongType()).alias("cell"),
+        col("_c5").cast(IntegerType()).alias("unit"),
+        col("_c6").cast(DoubleType()).alias("lon"),
+        col("_c7").cast(DoubleType()).alias("lat"),
+        col("_c8").cast(IntegerType()).alias("range_m"),
+        col("_c9").cast(IntegerType()).alias("samples"),
+        col("_c10").cast(IntegerType()).alias("changeable"),
+        from_unixtime(col("_c11").cast(LongType())).alias("created_ts"),
+        from_unixtime(col("_c12").cast(LongType())).alias("updated_ts"),
+        col("_c13").cast(IntegerType()).alias("avg_signal"),
     )

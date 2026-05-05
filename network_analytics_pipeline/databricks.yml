@@ -1,6 +1,7 @@
 # This is a Databricks Asset Bundle (DAB) — a.k.a. Declarative Automation Bundle —
-# scaffolding the network_analytics_pipeline Lakeflow Spark Declarative Pipeline.
-# Docs: https://docs.databricks.com/aws/en/dev-tools/bundles/
+# scaffolding the network_analytics_pipeline Lakeflow Spark Declarative Pipeline (SDP).
+# SDP: https://docs.databricks.com/aws/en/ldp
+# Bundles: https://docs.databricks.com/aws/en/dev-tools/bundles/
 
 bundle:
   name: network_analytics_pipeline
@@ -19,6 +20,11 @@ variables:
   raw_volume_path:
     description: Volume path holding the raw zip / csv files consumed by the pipeline.
     default: /Volumes/cmegdemos_catalog/network_analytics_enablement/raw_data
+  cell_towers_incoming_subdir:
+    description: >
+      Subdirectory under raw_volume_path where OpenCellID gzip CSV shards are
+      dropped (append-only). Auto Loader ingests all *.csv.gz files recursively.
+    default: cell_towers
   notifications_email:
     description: Optional email for pipeline failure notifications.
     default: ""
