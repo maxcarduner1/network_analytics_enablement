@@ -25,6 +25,16 @@ variables:
       Subdirectory under raw_volume_path where OpenCellID gzip CSV shards are
       dropped (append-only). Auto Loader ingests all *.csv.gz files recursively.
     default: cell_towers
+  ops_app_kpis_incoming_subdir:
+    description: >
+      Subdirectory under raw_volume_path where ops-app tower KPI gzip CSV shards
+      are dropped for Auto Loader ingestion.
+    default: kpis
+  ops_app_demand_incoming_subdir:
+    description: >
+      Subdirectory under raw_volume_path where ops-app building demand gzip CSV
+      shards are dropped for Auto Loader ingestion.
+    default: demand
   notifications_email:
     description: Optional email for pipeline failure notifications.
     default: ""

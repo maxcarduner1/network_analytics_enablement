@@ -18,6 +18,8 @@ resources:
         pipeline.catalog: ${var.catalog}
         pipeline.schema: ${var.schema}
         pipeline.raw_volume_path: ${var.raw_volume_path}
+        pipeline.ops_app_kpis_incoming_subdir: ${var.ops_app_kpis_incoming_subdir}
+        pipeline.ops_app_demand_incoming_subdir: ${var.ops_app_demand_incoming_subdir}
       environment:
         dependencies:
           - pandas

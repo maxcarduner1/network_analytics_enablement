@@ -1,106 +1,49 @@
-"""Bronze: synthetic hourly tower KPI events for Seattle T-Mobile towers."""
+"""Bronze: ops_app tower KPI events ingested via Auto Loader."""
 
 from pyspark import pipelines as dp
 from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.sql.types import DoubleType, LongType, TimestampType
+
+INCOMING_SUBDIR_DEFAULT = "kpis"
 
 
-@dp.materialized_view(
+@dp.table(
     name="ops_app_bronze_tower_hourly_kpis",
     comment=(
-        "Synthetic tower-level hourly KPIs for the last 14 days, generated from "
-        "Seattle T-Mobile towers at raw event grain."
+        "Ops-app tower KPI events ingested with Auto Loader from gzip CSV shards "
+        "under the configured incoming folder."
     ),
-    cluster_by=["tower_id", "event_ts"],
 )
 @dp.expect_or_drop("tower_id_not_null", "tower_id IS NOT NULL")
 @dp.expect_or_drop("utilization_in_bounds", "prb_utilization_pct BETWEEN 0 AND 100")
 @dp.expect_or_drop("latency_positive", "latency_ms > 0")
 def ops_app_bronze_tower_hourly_kpis():
     spark = SparkSession.builder.getOrCreate()
-    return spark.sql(
-        """
-        WITH hours AS (
-            SELECT explode(
-                sequence(
-                    date_trunc('hour', current_timestamp() - INTERVAL 14 DAYS),
-                    date_trunc('hour', current_timestamp()),
-                    INTERVAL 1 HOUR
-                )
-            ) AS event_ts
-        )
-        SELECT
-            t.tower_id,
-            h.event_ts,
-            ROUND(
-                LEAST(
-                    100.0,
-                    GREATEST(
-                        5.0,
-                        35
-                        + CASE
-                            WHEN hour(h.event_ts) BETWEEN 7 AND 10 THEN 28
-                            WHEN hour(h.event_ts) BETWEEN 17 AND 21 THEN 33
-                            WHEN hour(h.event_ts) BETWEEN 0 AND 5 THEN -12
-                            ELSE 0
-                          END
-                        + (rand() * 24 - 12)
-                    )
-                ),
-                2
-            ) AS prb_utilization_pct,
-            ROUND(
-                GREATEST(
-                    10.0,
-                    160
-                    - (COALESCE(t.avg_signal, -95) + 110) * 2.0
-                    + CASE
-                        WHEN hour(h.event_ts) BETWEEN 17 AND 21 THEN 18
-                        ELSE 0
-                      END
-                    + (rand() * 16 - 8)
-                ),
-                2
-            ) AS latency_ms,
-            ROUND(
-                GREATEST(
-                    0.0,
-                    LEAST(
-                        18.0,
-                        0.6
-                        + CASE
-                            WHEN hour(h.event_ts) BETWEEN 17 AND 21 THEN 2.2
-                            ELSE 0.8
-                          END
-                        + (rand() * 1.4)
-                    )
-                ),
-                3
-            ) AS packet_loss_pct,
-            ROUND(
-                GREATEST(
-                    20.0,
-                    240.0
-                    - (
-                        LEAST(
-                            100.0,
-                            GREATEST(
-                                5.0,
-                                35
-                                + CASE
-                                    WHEN hour(h.event_ts) BETWEEN 7 AND 10 THEN 28
-                                    WHEN hour(h.event_ts) BETWEEN 17 AND 21 THEN 33
-                                    WHEN hour(h.event_ts) BETWEEN 0 AND 5 THEN -12
-                                    ELSE 0
-                                  END
-                                + (rand() * 24 - 12)
-                            )
-                        )
-                    ) * 1.2
-                    + (rand() * 15 - 7.5)
-                ),
-                2
-            ) AS throughput_mbps
-        FROM silver_tmobile_towers_seattle t
-        CROSS JOIN hours h
-        """
+    volume_path = spark.conf.get(
+        "pipeline.raw_volume_path",
+        "/Volumes/cmegdemos_catalog/network_analytics_enablement/raw_data",
+    )
+    subdir = spark.conf.get(
+        "pipeline.ops_app_kpis_incoming_subdir",
+        INCOMING_SUBDIR_DEFAULT,
+    )
+    incoming_path = f"{volume_path.rstrip('/')}/{subdir}"
+
+    raw = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "csv")
+        .option("header", "false")
+        .option("pathGlobFilter", "*.csv.gz")
+        .option("recursiveFileLookup", "true")
+        .load(incoming_path)
+    )
+
+    return raw.select(
+        col("_c0").cast(LongType()).alias("tower_id"),
+        col("_c1").cast(TimestampType()).alias("event_ts"),
+        col("_c2").cast(DoubleType()).alias("prb_utilization_pct"),
+        col("_c3").cast(DoubleType()).alias("latency_ms"),
+        col("_c4").cast(DoubleType()).alias("packet_loss_pct"),
+        col("_c5").cast(DoubleType()).alias("throughput_mbps"),
     )

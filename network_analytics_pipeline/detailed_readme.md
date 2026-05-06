@@ -162,8 +162,9 @@ Dropped row counts on Silver reflect `expect_or_drop` on bbox and validity (ofte
 
 ## Bundle configuration
 
-- [databricks.yml](databricks.yml) — `bundle.name`, `include: resources/*.yml`, variables (`catalog`, `schema`, `raw_volume_path`, `cell_towers_incoming_subdir`), targets `dev` / `prod`.
+- [databricks.yml](databricks.yml) — `bundle.name`, `include: resources/*.yml`, variables (`catalog`, `schema`, `raw_volume_path`, `cell_towers_incoming_subdir`, `ops_app_kpis_incoming_subdir`, `ops_app_demand_incoming_subdir`), targets `dev` / `prod`.
 - [resources/network_analytics.pipeline.yml](resources/network_analytics.pipeline.yml) — `serverless: true`, `photon: true`, `libraries` glob for `../src/**`, `configuration` keys `pipeline.catalog`, `pipeline.schema`, `pipeline.raw_volume_path`, `pipeline.cell_towers_incoming_subdir`, `environment.dependencies` (`pyshp`, `pandas`).
+- [resources/ops_app_network_analytics.pipeline.yml](resources/ops_app_network_analytics.pipeline.yml) — `libraries` glob for `../src_ops_app/**`; reads Auto Loader subdirs `kpis/` and `demand/` via `pipeline.ops_app_kpis_incoming_subdir` / `pipeline.ops_app_demand_incoming_subdir`.
 
 ## Operational runbook
 
@@ -171,12 +172,18 @@ Dropped row counts on Silver reflect `expect_or_drop` on bbox and validity (ofte
 
 If this table was ever deployed as a **materialized view** and the code now defines it as a **streaming table** (`@dp.table` + Auto Loader), SDP rejects the update until the old object is removed. Run `DROP TABLE` on `bronze_cell_towers` in the pipeline catalog/schema (template: [scripts/drop_bronze_cell_towers_for_streaming_migration.sql](scripts/drop_bronze_cell_towers_for_streaming_migration.sql)), then redeploy and run the pipeline.
 
+**`CANNOT_CHANGE_DATASET_TYPE` on `ops_app_bronze_*`**
+
+If ops-app bronze tables were previously materialized views, drop them once before running the converted streaming definitions (template: [scripts/drop_ops_app_bronze_for_streaming_migration.sql](scripts/drop_ops_app_bronze_for_streaming_migration.sql)).
+
 **Prerequisites**
 
 - Databricks CLI installed and authenticated (`databricks auth profiles` shows `Valid: YES` for your profile).
 - If `DATABRICKS_TOKEN` is set in the shell, it can override profile OAuth; unset it when debugging “invalid refresh token” while the profile is fresh.
 - Volume contains the FCC zip and `Washington.zip` at the paths expected by the two batch Bronze MVs.
 - OpenCellID: at least one headerless `*.csv.gz` under `{raw_volume_path}/{cell_towers_incoming_subdir}/` (default `.../raw_data/cell_towers/`). Additional dated files are ingested append-only on subsequent pipeline updates.
+- Ops-app KPI feed: at least one headerless `*.csv.gz` under `{raw_volume_path}/{ops_app_kpis_incoming_subdir}/` (default `.../raw_data/kpis/`).
+- Ops-app demand feed: at least one headerless `*.csv.gz` under `{raw_volume_path}/{ops_app_demand_incoming_subdir}/` (default `.../raw_data/demand/`).
 
 **Standard loop**
 
@@ -224,6 +231,10 @@ Upgrading the Databricks CLI to a current release (see Databricks docs) removes 
 | [src/bronze/bronze_fcc_bdc_h3.py](src/bronze/bronze_fcc_bdc_h3.py) | Zip → GeoPackage → pandas → Spark; FCC expectations |
 | [src/bronze/bronze_building_footprints.py](src/bronze/bronze_building_footprints.py) | Zip → shapefile → WKT rows; footprint expectations |
 | [src/bronze/bronze_cell_towers.py](src/bronze/bronze_cell_towers.py) | Auto Loader (`cloudFiles`) streaming ingest of gzip CSV shards; OpenCellID expectations |
+| [src_ops_app/bronze/ops_app_bronze_tower_hourly_kpis.py](src_ops_app/bronze/ops_app_bronze_tower_hourly_kpis.py) | Auto Loader (`cloudFiles`) streaming ingest of ops KPI shards from `raw_data/kpis/` |
+| [src_ops_app/bronze/ops_app_bronze_building_hourly_demand.py](src_ops_app/bronze/ops_app_bronze_building_hourly_demand.py) | Auto Loader (`cloudFiles`) streaming ingest of ops demand shards from `raw_data/demand/` |
+| [notebooks/demo_generate_ops_app_kpis_shard.ipynb](notebooks/demo_generate_ops_app_kpis_shard.ipynb) | Generates random KPI shards by sampling `raw_data/310.csv.gz` |
+| [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb) | Generates random demand shards by sampling `raw_data/310.csv.gz` |
 | [src/silver/silver_fcc_bdc_h3_seattle.py](src/silver/silver_fcc_bdc_h3_seattle.py) | H3 center lat/lon + Seattle bbox |
 | [src/silver/silver_building_footprints_seattle.py](src/silver/silver_building_footprints_seattle.py) | WKT → `GEOMETRY(4326)` + bbox |
 | [src/silver/silver_tmobile_towers_seattle.py](src/silver/silver_tmobile_towers_seattle.py) | T-Mobile + `ST_Point` |

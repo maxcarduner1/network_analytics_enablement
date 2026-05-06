@@ -119,10 +119,13 @@ network_analytics_pipeline/
 ├── README.md                             # this file
 ├── AGENTS.md / CLAUDE.md                 # agent guidance
 ├── notebooks/
-│   └── demo_generate_cell_towers_shard.ipynb  # demo shards → raw_data/cell_towers/
+│   ├── demo_generate_cell_towers_shard.ipynb      # base Auto Loader shards → raw_data/cell_towers/
+│   ├── demo_generate_ops_app_kpis_shard.ipynb     # ops KPI shards → raw_data/kpis/
+│   └── demo_generate_ops_app_demand_shard.ipynb   # ops demand shards → raw_data/demand/
 ├── resources/
-│   └── network_analytics.pipeline.yml    # Pipeline resource (serverless)
-└── src/
+│   ├── network_analytics.pipeline.yml        # Base pipeline resource (serverless)
+│   └── ops_app_network_analytics.pipeline.yml # Ops-app pipeline resource (serverless)
+├── src/
     ├── bronze/
     │   ├── bronze_fcc_bdc_h3.py
     │   ├── bronze_building_footprints.py
@@ -134,6 +137,15 @@ network_analytics_pipeline/
     └── gold/
         ├── gold_downtown_building_coverage.py
         └── gold_coverage_by_distance_bucket.py
+└── src_ops_app/
+    ├── bronze/
+    │   ├── ops_app_bronze_tower_hourly_kpis.py
+    │   └── ops_app_bronze_building_hourly_demand.py
+    ├── silver/
+    │   ├── ops_app_silver_tower_kpis_latest.py
+    │   └── ops_app_silver_building_demand_latest.py
+    └── gold/
+        └── ops_app_gold_downtown_building_coverage.py
 ```
 
 ## Tables produced
@@ -182,6 +194,22 @@ The next update recreates `bronze_cell_towers` as a streaming table and refreshe
 - **Semantics:** Append-only incremental ingest: each pipeline update processes **new** files since the streaming checkpoint. Ad-hoc drops are picked up on the next run (pipeline `continuous: false` is fine).
 - **Implementation:** `@dp.table()` + `spark.readStream.format("cloudFiles")` — see [Auto Loader](https://docs.databricks.com/aws/en/ingestion/auto-loader/index) and [SDP](https://docs.databricks.com/aws/en/ldp). Downstream silver still batch-reads `bronze_cell_towers` with `spark.read.table(...)`.
 - **Demo notebook:** [notebooks/demo_generate_cell_towers_shard.ipynb](notebooks/demo_generate_cell_towers_shard.ipynb) — random sample gzip from `raw_data/310.csv.gz` → writes into **`raw_data/cell_towers/`** for Auto Loader.
+
+## Ops-app pipeline (`ops_app_network_analytics_pipeline`)
+
+The repo also includes an ops-enrichment pipeline that writes `ops_app_*` tables and merges into `ops_app_gold_downtown_building_coverage`.
+
+- **Auto Loader inputs:**  
+  - KPI shards: `{raw_volume_path}/{ops_app_kpis_incoming_subdir}/` (default `raw_data/kpis/`)  
+  - Demand shards: `{raw_volume_path}/{ops_app_demand_incoming_subdir}/` (default `raw_data/demand/`)
+- **Demo notebooks:**  
+  - [notebooks/demo_generate_ops_app_kpis_shard.ipynb](notebooks/demo_generate_ops_app_kpis_shard.ipynb)  
+  - [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb)
+- **Run:** `databricks bundle run ops_app_network_analytics_pipeline -t dev --profile fevm-cmegdemos`
+
+### Migration note for ops_app bronze tables
+
+If an older deployment created `ops_app_bronze_tower_hourly_kpis` / `ops_app_bronze_building_hourly_demand` as materialized views, switching to streaming Auto Loader tables requires a one-time drop first (same `CANNOT_CHANGE_DATASET_TYPE` rule). Use [scripts/drop_ops_app_bronze_for_streaming_migration.sql](scripts/drop_ops_app_bronze_for_streaming_migration.sql), then redeploy and rerun.
 
 ## Design notes
 
