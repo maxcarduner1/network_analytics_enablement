@@ -1,0 +1,12 @@
+command:
+  - python
+  - app.py
+env:
+  - name: DEFAULT_CATALOG
+    value: cmegdemos_catalog
+  - name: DEFAULT_SCHEMA
+    value: network_analytics_enablement
+  - name: DEFAULT_TABLE
+    value: ops_app_gold_downtown_building_coverage
+  - name: DEFAULT_METRIC
+    value: prb_utilization_pct
