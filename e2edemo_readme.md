@@ -1,6 +1,6 @@
 # Network Analytics — End-to-End Demo Guide
 
-A walkthrough of the full stack: raw files in a Volume → Bronze/Silver/Gold via a serverless DLT pipeline → three ways to query the result (Genie, Knowledge Assistant, Supervisor Agent).
+A walkthrough of the full stack: raw files in a Volume → Bronze/Silver/Gold via a serverless **Lakeflow Spark Declarative Pipeline** (**SDP**) → three ways to query the result (Genie, Knowledge Assistant, Supervisor Agent). See [SDP documentation](https://docs.databricks.com/aws/en/ldp).
 
 Workspace: [`fevm-cmegdemos`](https://fevm-cmegdemos.cloud.databricks.com)
 
@@ -13,7 +13,7 @@ Workspace: [`fevm-cmegdemos`](https://fevm-cmegdemos.cloud.databricks.com)
         │  RAW (UC Volume: raw_data)                             │
         │  bdc_53_5GNR_..._14apr2026.zip │ Washington.zip │ 310.csv.gz
         └─────────────────────┬──────────────────────────────────┘
-                              │  serverless DLT pipeline
+                              │  serverless SDP pipeline
         ┌─────────────────────▼──────────────────────────────────┐
         │  BRONZE — raw, deduplicated, schema-typed              │
         │  bronze_fcc_bdc_h3   bronze_building_footprints        │
@@ -65,7 +65,7 @@ Workspace: [`fevm-cmegdemos`](https://fevm-cmegdemos.cloud.databricks.com)
 
 ---
 
-## 3. DLT Pipeline
+## 3. Lakeflow SDP pipeline
 
 [**`network_analytics_pipeline`** (open in Pipelines UI)](https://fevm-cmegdemos.cloud.databricks.com/pipelines/ce588a95-7d89-4e58-a907-71364c01390f)
 
@@ -114,7 +114,11 @@ Microsoft footprints should always be polygons. If a row comes in as a LINESTRIN
 Negative building height is nonsensical but rare and might be a sentinel for "unknown." Warn-only so the metric surfaces if a bad batch lands.
 
 #### [`bronze_cell_towers`](https://fevm-cmegdemos.cloud.databricks.com/explore/data/cmegdemos_catalog/network_analytics_enablement/bronze_cell_towers)
-Source: `310.csv.gz` (OpenCellID, US-only) — [bronze_cell_towers.py](network_analytics_pipeline/src/bronze/bronze_cell_towers.py)
+**Source:** headerless gzip CSV shards under **`raw_data/cell_towers/*.csv.gz`** — [**Auto Loader**](https://docs.databricks.com/aws/en/ingestion/auto-loader/index) (`cloudFiles`) into a **streaming** Delta table — [bronze_cell_towers.py](network_analytics_pipeline/src/bronze/bronze_cell_towers.py). Append-only: each pipeline update ingests **new** files since the last checkpoint.
+
+**Canonical extract:** keep **`310.csv.gz`** at the volume root if you still run **`01_Ingest.ipynb`** or use [**demo_generate_cell_towers_shard.ipynb**](network_analytics_pipeline/notebooks/demo_generate_cell_towers_shard.ipynb) to sample random shards **into `cell_towers/`** for incremental demos.
+
+**Migration:** If you previously deployed `bronze_cell_towers` as a materialized view, SDP cannot flip it to streaming in place — run **`DROP TABLE`** then redeploy (see [scripts/drop_bronze_cell_towers_for_streaming_migration.sql](network_analytics_pipeline/scripts/drop_bronze_cell_towers_for_streaming_migration.sql)).
 
 ```python
 @dp.expect_or_drop("non_null_cell", "cell IS NOT NULL")
@@ -244,7 +248,7 @@ A NULL average usually means an empty group survived the prior `expect_or_fail`.
 
 ### 3.4 Reference notebooks (alternative imperative path)
 
-The same pipeline can be expressed as plain notebooks (bypassing DLT):
+The same pipeline can be expressed as plain notebooks (bypassing the managed SDP pipeline):
 
 - [`01_Ingest.ipynb`](01_Ingest.ipynb)
 - [`02_Analysis.ipynb`](02_Analysis.ipynb)
@@ -305,7 +309,7 @@ These show how the SA uses the assets to drive a customer conversation:
 | # | Customer prompt to SA | SA does |
 | --- | --- | --- |
 | SA1 | *"Can your platform tell me where my buildings have weak 5G?"* | Open Genie → run G1; open KA → ask K4 to set expectations on what "weak" means |
-| SA2 | *"How do I trust the data?"* | KA → K1, K3 (governance + challenge process). Then point at the DLT pipeline expectations table in §3 |
+| SA2 | *"How do I trust the data?"* | KA → K1, K3 (governance + challenge process). Then point at the SDP pipeline **Data Quality** / expectations metrics in §3 |
 | SA3 | *"Can I plug in my own carrier?"* | Show `silver_tmobile_towers_seattle.py` filter — change MNC. Discuss bronze→silver pattern |
 | SA4 | *"Who is using this assistant?"* | Open the supervisor's MLflow experiment, filter traces by `end_user_email` tag |
 | SA5 | *"Build me a custom assistant on my own docs."* | Show `Volume → Knowledge Assistant create-knowledge-source` flow we used here |

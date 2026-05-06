@@ -14,8 +14,10 @@ The pipeline analyzes **T-Mobile 5G NR coverage of buildings in downtown Seattle
 ┌─────────────────────────────────────────────────────────┐
 │  Raw Data (Unity Catalog Volume: raw_data)              │
 │                                                         │
-│  bdc_53_5GNR_...zip  Washington.zip  310.csv.gz         │
-│  (FCC BDC GeoPackage) (Shapefiles)  (OpenCellID CSV)   │
+│  bdc_*…zip  Washington.zip  310.csv.gz + cell_towers/*.csv.gz │
+│  (FCC zip)  (Shapefiles)   (OpenCellID: notebooks read    │
+│                             root file; SDP bundle ingests │
+│                             shards under cell_towers/)    │
 └────────────┬──────────────┬───────────────┬─────────────┘
              │  01_ingest   │               │
              ▼              ▼               ▼
@@ -45,6 +47,8 @@ The pipeline analyzes **T-Mobile 5G NR coverage of buildings in downtown Seattle
         + distance vs. signal analysis
 ```
 
+**SDP bundle (`network_analytics_pipeline/`):** OpenCellID flows through **`raw_data/cell_towers/*.csv.gz`** via Auto Loader into **`bronze_cell_towers`** (streaming Delta). Keep an optional canonical **`310.csv.gz`** at the volume root for notebooks and for [demo_generate_cell_towers_shard.ipynb](network_analytics_pipeline/notebooks/demo_generate_cell_towers_shard.ipynb), which writes random sample shards into **`cell_towers/`**. See [network_analytics_pipeline/README.md](network_analytics_pipeline/README.md).
+
 ## Notebooks
 
 ### `01_ingest` — Raw File Ingestion
@@ -55,7 +59,7 @@ Reads three compressed/archived geospatial files from a Unity Catalog volume and
 | --- | --- | --- | --- | --- |
 | `bdc_53_5GNR_mobile_broadband_h3_J25_14apr2026.zip` | GeoPackage (.gpkg) in zip | `fcc_bdc_h3_seattle` | 13,966 | sqlite3 rtree pre-filter + H3 center bbox |
 | `Washington.zip` | Shapefile (.shp) in zip | `building_footprints` | 442,320 | geopandas read, WKT to native geometry(4326) |
-| `310.csv.gz` | Headerless gzipped CSV | `cell_towers` | 2,312 | Spark CSV, filter MNC 260 (T-Mobile) + bbox |
+| `310.csv.gz` at volume root (typical notebook ingest) | Headerless gzipped CSV | `cell_towers` | 2,312 | Spark CSV, filter MNC 260 (T-Mobile) + bbox |
 
 ### `02_analysis` — Downtown Seattle Coverage Estimation
 
@@ -90,6 +94,17 @@ All tables live in **`cmegdemos_catalog.network_enablement_demo_test`**. Both no
 5. The interactive heatmap in Step 5 is scrollable/zoomable and shows tower locations as red markers
 
 To re-run from scratch against a different catalog/schema, update the `CATALOG` and `SCHEMA` variables in the setup cell of each notebook.
+
+## Medallion pipeline (SDP)
+
+The same transformations are also available as bundle-deployable **Lakeflow Spark Declarative Pipelines** (**SDP**) under [`network_analytics_pipeline/`](network_analytics_pipeline/). Product documentation: [Lakeflow Spark Declarative Pipelines](https://docs.databricks.com/aws/en/ldp).
+
+| Bundle resource | Role |
+| --- | --- |
+| **`network_analytics_pipeline`** | Main medallion: FCC + buildings + OpenCellID (**Auto Loader** from `raw_data/cell_towers/`) → gold coverage tables. |
+| **`ops_app_network_analytics_pipeline`** *(optional)* | Synthetic ops KPIs + **`ops_app_gold_downtown_building_coverage`** merged with baseline gold; uses `ops_app_*` table prefixes. Same catalog/schema by default. |
+
+Details, expectations, migration (**MV → streaming** for `bronze_cell_towers`), and the demo notebook live in [**network_analytics_pipeline/README.md**](network_analytics_pipeline/README.md) and [**network_analytics_pipeline/detailed_readme.md**](network_analytics_pipeline/detailed_readme.md).
 
 ## Genie Code Instruction Pattern
 
