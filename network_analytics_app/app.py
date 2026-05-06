@@ -145,9 +145,14 @@ def fetch_hex_aggregate(catalog, schema, table, metric, resolution, bounds) -> p
     bounds_wkt = bounds_to_wkt(bounds)
     where = "1=1"
     if bounds_wkt:
+        # H3_COVERASH3 returns BIGINT; h3_toparent on a STRING column returns
+        # STRING. Cast the cover output to string so the IN-list types match.
         where = (
-            f"h3_toparent({H3_COLUMN}, {resolution}) IN "
-            f"(SELECT EXPLODE(H3_COVERASH3('{bounds_wkt}', {resolution})))"
+            f"h3_toparent({H3_COLUMN}, {resolution}) IN ("
+            f"  SELECT h3_h3tostring(h) FROM ("
+            f"    SELECT EXPLODE(H3_COVERASH3('{bounds_wkt}', {resolution})) AS h"
+            f"  )"
+            f")"
         )
     stmt = f"""
         WITH cell_agg AS (

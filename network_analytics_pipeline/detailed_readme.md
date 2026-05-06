@@ -54,10 +54,44 @@ Override via bundle variable `raw_volume_path` in [databricks.yml](databricks.ym
 
 **OpenCellID incoming folder:** gzip CSV shards (append-only) must live under `{raw_volume_path}/{cell_towers_incoming_subdir}/` (default subdir `cell_towers`). Override with bundle variable `cell_towers_incoming_subdir` → `pipeline.cell_towers_incoming_subdir`.
 
+**Ops-app incoming folders (second bundle):** gzip CSV shards under `{raw_volume_path}/{ops_app_kpis_incoming_subdir}/` (default **`kpis`**) and `{raw_volume_path}/{ops_app_demand_incoming_subdir}/` (default **`demand`**). Variables in [databricks.yml](databricks.yml) map to Spark conf **`pipeline.ops_app_kpis_incoming_subdir`** / **`pipeline.ops_app_demand_incoming_subdir`**.
+
+### Ops-app DAG (`ops_app_network_analytics_pipeline`)
+
+Independent Lakeflow SDP resource; **reads** **`gold_downtown_building_coverage`** from the same **`catalog` / `schema`** as the bundle variables (that gold table must exist before **`ops_app_gold_downtown_building_coverage`** can populate).
+
+```mermaid
+flowchart LR
+    subgraph raw_ops [Volume subdirs]
+        K["kpis/*.csv.gz"]
+        D["demand/*.csv.gz"]
+    end
+
+    subgraph bronze_ops [Bronze streaming]
+        Bk["ops_app_bronze_tower_hourly_kpis"]
+        Bd["ops_app_bronze_building_hourly_demand"]
+    end
+
+    subgraph silver_ops [Silver MV]
+        Sk["ops_app_silver_tower_kpis_latest"]
+        Sd["ops_app_silver_building_demand_latest"]
+    end
+
+    subgraph gold_join [Gold MV]
+        Gbase["gold_downtown_building_coverage"]
+        Og["ops_app_gold_downtown_building_coverage"]
+    end
+
+    K --> Bk --> Sk --> Og
+    D --> Bd --> Sd --> Og
+    Gbase --> Og
+```
+
 ## Dataset types and APIs
 
 - **Language:** Python only (Bronze must read GeoPackage via `sqlite3` and Shapefile via `pyshp`; Silver/Gold use Spark SQL).
 - **Dataset kind:** `@dp.materialized_view()` for FCC and buildings (batch extracts from zips). **`bronze_cell_towers`** is a **`@dp.table()` streaming table** fed by Auto Loader (`cloudFiles`) for append-only gzip CSV drops under `cell_towers/`.
+- **Ops-app bundle:** **`ops_app_bronze_tower_hourly_kpis`** and **`ops_app_bronze_building_hourly_demand`** are **`@dp.table()` streaming tables** (Auto Loader on **`kpis/`** and **`demand/`**). Silver and gold ops datasets are **`@dp.materialized_view()`**.
 - **Imports:** `from pyspark import pipelines as dp` per [SDP development](https://docs.databricks.com/aws/en/ldp/developer); do not use the deprecated `dlt` Python package in new code.
 - **Cross-dataset reads:** `spark.read.table("upstream_name")` or unqualified names inside `spark.sql(...)` that resolve to pipeline-published datasets in the pipeline catalog/schema.
 
@@ -73,6 +107,16 @@ Override via bundle variable `raw_volume_path` in [databricks.yml](databricks.ym
 | Silver | `silver_tmobile_towers_seattle` | MNC 260, Seattle bbox, `ST_Point` as `location`. |
 | Gold | `gold_downtown_building_coverage` | Downtown bbox buildings × BDC aggregate × nearest tower (matches notebook 02 shape). |
 | Gold | `gold_coverage_by_distance_bucket` | Aggregated distance vs. signal for buildings with `best_download_mbps > 0`. |
+
+**Ops-app bundle (same catalog/schema)**
+
+| Layer | Table | Role |
+| --- | --- | --- |
+| Bronze | `ops_app_bronze_tower_hourly_kpis` | Streaming ingest of headerless KPI CSV.gz (`tower_id`, `event_ts`, utilization, latency, loss, throughput). |
+| Bronze | `ops_app_bronze_building_hourly_demand` | Streaming ingest of headerless demand CSV.gz (`building_id`, `event_ts`, users, `traffic_mix`, indoor penetration). |
+| Silver | `ops_app_silver_tower_kpis_latest` | Latest KPI row per `tower_id`; derives **`tower_health_band`** (`critical` / `watch` / `healthy`). |
+| Silver | `ops_app_silver_building_demand_latest` | Latest demand row per `building_id`; derives **`effective_radio_load_score`**. |
+| Gold | `ops_app_gold_downtown_building_coverage` | Baseline **`gold_downtown_building_coverage`** LEFT JOIN demand on **`building_id`** and KPI on **`nearest_tower_id`**; adds **`building_service_risk_band`**. |
 
 **Bounding boxes in code**
 
@@ -137,6 +181,39 @@ Implemented in [src/bronze/](src/bronze/):
 | `gold_coverage_by_distance_bucket` | `non_negative_avg_speed` | `avg_download_mbps >= 0` | **fail** |
 | `gold_coverage_by_distance_bucket` | `non_null_avg_speed` | avg speed not null | warn |
 
+### Ops-app expectations
+
+Implemented under [src_ops_app/](src_ops_app/):
+
+**Bronze**
+
+| Dataset | Name | Constraint (summary) | Severity |
+| --- | --- | --- | --- |
+| `ops_app_bronze_tower_hourly_kpis` | `tower_id_not_null` | `tower_id IS NOT NULL` | drop |
+| `ops_app_bronze_tower_hourly_kpis` | `utilization_in_bounds` | `prb_utilization_pct` between 0 and 100 | drop |
+| `ops_app_bronze_tower_hourly_kpis` | `latency_positive` | `latency_ms > 0` | drop |
+| `ops_app_bronze_building_hourly_demand` | `building_id_not_null` | `building_id IS NOT NULL` | drop |
+| `ops_app_bronze_building_hourly_demand` | `non_negative_demand_users` | `demand_users >= 0` | drop |
+| `ops_app_bronze_building_hourly_demand` | `indoor_penetration_in_range` | factor between 0.4 and 1.0 | drop |
+
+**Silver**
+
+| Dataset | Name | Constraint (summary) | Severity |
+| --- | --- | --- | --- |
+| `ops_app_silver_tower_kpis_latest` | `valid_utilization` | utilization 0–100 | drop |
+| `ops_app_silver_tower_kpis_latest` | `valid_packet_loss` | loss 0–100 | drop |
+| `ops_app_silver_tower_kpis_latest` | `valid_throughput` | throughput ≥ 0 | drop |
+| `ops_app_silver_building_demand_latest` | `valid_demand_users` | users ≥ 0 | drop |
+| `ops_app_silver_building_demand_latest` | `valid_mix` | `traffic_mix IN ('video_heavy','commute','balanced')` | warn |
+
+**Gold**
+
+| Dataset | Name | Constraint (summary) | Severity |
+| --- | --- | --- | --- |
+| `ops_app_gold_downtown_building_coverage` | `non_negative_download` | `best_download_mbps >= 0` | fail |
+| `ops_app_gold_downtown_building_coverage` | `has_building_id` | `building_id IS NOT NULL` | drop |
+| `ops_app_gold_downtown_building_coverage` | `has_nearest_tower` | `nearest_tower_id IS NOT NULL` | drop |
+
 ## Data Quality and event log
 
 In the workspace: open the pipeline → **Graph** (DAG) and **Data Quality** (per-expectation counts).
@@ -195,6 +272,17 @@ databricks bundle deploy -t dev --profile <profile>
 databricks bundle run network_analytics_pipeline -t dev --profile <profile>
 ```
 
+**Ops overlay loop** (after base gold exists; drop KPI/demand gz shards into the volume or run the demo notebooks in `notebooks/`):
+
+```bash
+cd network_analytics_pipeline
+
+databricks bundle deploy -t dev --profile <profile>
+databricks bundle run ops_app_network_analytics_pipeline -t dev --profile <profile>
+```
+
+The ops pipeline depends on **`gold_downtown_building_coverage`** already present in the target catalog/schema. Demo generators require **`silver_tmobile_towers_seattle`** (KPI) and **`gold_downtown_building_coverage`** (demand IDs / heights).
+
 **Selective refresh** (after changing only Gold, for example):
 
 ```bash
@@ -233,12 +321,14 @@ Upgrading the Databricks CLI to a current release (see Databricks docs) removes 
 | [src/bronze/bronze_cell_towers.py](src/bronze/bronze_cell_towers.py) | Auto Loader (`cloudFiles`) streaming ingest of gzip CSV shards; OpenCellID expectations |
 | [src_ops_app/bronze/ops_app_bronze_tower_hourly_kpis.py](src_ops_app/bronze/ops_app_bronze_tower_hourly_kpis.py) | Auto Loader (`cloudFiles`) streaming ingest of ops KPI shards from `raw_data/kpis/` |
 | [src_ops_app/bronze/ops_app_bronze_building_hourly_demand.py](src_ops_app/bronze/ops_app_bronze_building_hourly_demand.py) | Auto Loader (`cloudFiles`) streaming ingest of ops demand shards from `raw_data/demand/` |
-| [notebooks/demo_generate_ops_app_kpis_shard.ipynb](notebooks/demo_generate_ops_app_kpis_shard.ipynb) | Generates random KPI shards by sampling `raw_data/310.csv.gz` |
-| [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb) | Generates random demand shards by sampling `raw_data/310.csv.gz` |
+| [notebooks/demo_generate_ops_app_kpis_shard.ipynb](notebooks/demo_generate_ops_app_kpis_shard.ipynb) | Writes KPI gz shards to **`kpis/`**; **`tower_id`** from **`silver_tmobile_towers_seattle`**; synthetic metrics seeded from **`310.csv.gz`**. |
+| [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb) | Writes demand gz shards to **`demand/`**; **`building_id`** / height from **`gold_downtown_building_coverage`**; synthetic demand seeded from **`310.csv.gz`**. |
 | [src/silver/silver_fcc_bdc_h3_seattle.py](src/silver/silver_fcc_bdc_h3_seattle.py) | H3 center lat/lon + Seattle bbox |
 | [src/silver/silver_building_footprints_seattle.py](src/silver/silver_building_footprints_seattle.py) | WKT → `GEOMETRY(4326)` + bbox |
 | [src/silver/silver_tmobile_towers_seattle.py](src/silver/silver_tmobile_towers_seattle.py) | T-Mobile + `ST_Point` |
 | [src/gold/gold_downtown_building_coverage.py](src/gold/gold_downtown_building_coverage.py) | Downtown join + nearest tower |
 | [src/gold/gold_coverage_by_distance_bucket.py](src/gold/gold_coverage_by_distance_bucket.py) | Distance buckets vs. signal |
+| [scripts/drop_bronze_cell_towers_for_streaming_migration.sql](scripts/drop_bronze_cell_towers_for_streaming_migration.sql) | One-time drop template when **`bronze_cell_towers`** MV → streaming |
+| [scripts/drop_ops_app_bronze_for_streaming_migration.sql](scripts/drop_ops_app_bronze_for_streaming_migration.sql) | One-time drop template when **`ops_app_bronze_*`** MV → streaming |
 
-For a short overview and the same Mermaid diagram, see [README.md](README.md).
+For a short overview and the main Mermaid diagram, see [README.md](README.md).

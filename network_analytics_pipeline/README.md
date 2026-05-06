@@ -45,6 +45,46 @@ The Lakeflow pipeline UI auto-renders the same DAG once deployed, with green/red
 borders on each node reflecting Expectation pass/fail counts for the most recent
 update.
 
+### Ops-app pipeline DAG (`ops_app_network_analytics_pipeline`)
+
+Separate SDP bundle resource reading **`kpis/`** and **`demand/`** gzip CSV shards; publishes **`ops_app_*`** datasets and merges into **`ops_app_gold_downtown_building_coverage`** (baseline **`gold_downtown_building_coverage`** plus latest synthetic demand and nearest-tower KPIs).
+
+```mermaid
+flowchart LR
+    subgraph raw_ops [Raw — same UC volume subdirs]
+        K["kpis/*.csv.gz"]
+        D["demand/*.csv.gz"]
+    end
+
+    subgraph bronze_ops [Bronze — streaming Δ]
+        Bk["ops_app_bronze_tower_hourly_kpis"]
+        Bd["ops_app_bronze_building_hourly_demand"]
+    end
+
+    subgraph silver_ops [Silver — latest snapshot MVs]
+        Sk["ops_app_silver_tower_kpis_latest"]
+        Sd["ops_app_silver_building_demand_latest"]
+    end
+
+    subgraph gold_ops [Gold — merge MV]
+        Gbase["gold_downtown_building_coverage<br/><i>from base SDP</i>"]
+        Og["ops_app_gold_downtown_building_coverage"]
+    end
+
+    K --> Bk --> Sk --> Og
+    D --> Bd --> Sd --> Og
+    Gbase --> Og
+```
+
+**Headerless CSV layouts** (must match column order in bronze):
+
+| Feed | Columns `_c0` … |
+| --- | --- |
+| KPI | `tower_id`, `event_ts`, `prb_utilization_pct`, `latency_ms`, `packet_loss_pct`, `throughput_mbps` |
+| Demand | `building_id`, `event_ts`, `demand_users`, `traffic_mix`, `indoor_penetration_factor` |
+
+Demo notebooks write gz shards using **real IDs** from **`silver_tmobile_towers_seattle`** (KPI) and **`gold_downtown_building_coverage`** (demand); run the **main** pipeline first so those tables exist.
+
 ## Expectations at a glance
 
 Three escalating severity levels per layer:
@@ -122,6 +162,9 @@ network_analytics_pipeline/
 │   ├── demo_generate_cell_towers_shard.ipynb      # base Auto Loader shards → raw_data/cell_towers/
 │   ├── demo_generate_ops_app_kpis_shard.ipynb     # ops KPI shards → raw_data/kpis/
 │   └── demo_generate_ops_app_demand_shard.ipynb   # ops demand shards → raw_data/demand/
+├── scripts/
+│   ├── drop_bronze_cell_towers_for_streaming_migration.sql
+│   └── drop_ops_app_bronze_for_streaming_migration.sql
 ├── resources/
 │   ├── network_analytics.pipeline.yml        # Base pipeline resource (serverless)
 │   └── ops_app_network_analytics.pipeline.yml # Ops-app pipeline resource (serverless)
@@ -197,15 +240,18 @@ The next update recreates `bronze_cell_towers` as a streaming table and refreshe
 
 ## Ops-app pipeline (`ops_app_network_analytics_pipeline`)
 
-The repo also includes an ops-enrichment pipeline that writes `ops_app_*` tables and merges into `ops_app_gold_downtown_building_coverage`.
+The repo also includes an ops-enrichment pipeline that writes **`ops_app_bronze_*`** (streaming), **`ops_app_silver_*`** (latest row per tower/building), and **`ops_app_gold_downtown_building_coverage`** (join to **`gold_downtown_building_coverage`** on **`building_id`** / **`nearest_tower_id`**).
 
 - **Auto Loader inputs:**  
-  - KPI shards: `{raw_volume_path}/{ops_app_kpis_incoming_subdir}/` (default `raw_data/kpis/`)  
-  - Demand shards: `{raw_volume_path}/{ops_app_demand_incoming_subdir}/` (default `raw_data/demand/`)
+  - KPI shards: `{raw_volume_path}/{ops_app_kpis_incoming_subdir}/` (default **`raw_data/kpis/`**)  
+  - Demand shards: `{raw_volume_path}/{ops_app_demand_incoming_subdir}/` (default **`raw_data/demand/`**)  
+  Configure subdir names via **`ops_app_kpis_incoming_subdir`** / **`ops_app_demand_incoming_subdir`** in [databricks.yml](databricks.yml) (passed as Spark conf **`pipeline.ops_app_*`**).
 - **Demo notebooks:**  
   - [notebooks/demo_generate_ops_app_kpis_shard.ipynb](notebooks/demo_generate_ops_app_kpis_shard.ipynb)  
-  - [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb)
-- **Run:** `databricks bundle run ops_app_network_analytics_pipeline -t dev --profile fevm-cmegdemos`
+  - [notebooks/demo_generate_ops_app_demand_shard.ipynb](notebooks/demo_generate_ops_app_demand_shard.ipynb)  
+  Both sample OpenCellID **`310.csv.gz`** to drive synthetic metric variance; see DAG section above for CSV schemas.
+- **Run:** `databricks bundle run ops_app_network_analytics_pipeline -t dev --profile fevm-cmegdemos`  
+  Prerequisite: **`network_analytics_pipeline`** has produced **`gold_downtown_building_coverage`** (and shards dropped under **`kpis/`** / **`demand/`**).
 
 ### Migration note for ops_app bronze tables
 
