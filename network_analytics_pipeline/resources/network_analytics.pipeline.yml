@@ -1,0 +1,28 @@
+# Lakeflow Spark Declarative Pipeline (SDP) definition.
+# Bronze / Silver / Gold medallion for T-Mobile 5G NR coverage of Seattle buildings.
+# https://docs.databricks.com/aws/en/ldp
+
+resources:
+  pipelines:
+    network_analytics_pipeline:
+      name: network_analytics_pipeline
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      photon: true
+      channel: CURRENT
+      development: true
+      continuous: false
+      libraries:
+        - glob:
+            include: ../src/**
+      configuration:
+        # Surface variables to pipeline code via spark.conf.get(...)
+        pipeline.catalog: ${var.catalog}
+        pipeline.schema: ${var.schema}
+        pipeline.raw_volume_path: ${var.raw_volume_path}
+        pipeline.cell_towers_incoming_subdir: ${var.cell_towers_incoming_subdir}
+      environment:
+        dependencies:
+          - pyshp
+          - pandas

@@ -1,0 +1,25 @@
+# Lakeflow Spark Declarative Pipeline (SDP) — ops synthetic layer + merge to gold.
+# https://docs.databricks.com/aws/en/ldp
+resources:
+  pipelines:
+    ops_app_network_analytics_pipeline:
+      name: ops_app_network_analytics_pipeline
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      photon: true
+      channel: CURRENT
+      development: true
+      continuous: false
+      libraries:
+        - glob:
+            include: ../src_ops_app/**
+      configuration:
+        pipeline.catalog: ${var.catalog}
+        pipeline.schema: ${var.schema}
+        pipeline.raw_volume_path: ${var.raw_volume_path}
+        pipeline.ops_app_kpis_incoming_subdir: ${var.ops_app_kpis_incoming_subdir}
+        pipeline.ops_app_demand_incoming_subdir: ${var.ops_app_demand_incoming_subdir}
+      environment:
+        dependencies:
+          - pandas
