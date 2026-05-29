@@ -62,20 +62,176 @@ Expected runtime: ~2 min. After this, the bronze layer is ready for any number o
 
 ---
 
-## Step 2 — Create the Lakeflow pipeline and open in Designer
+## Step 2 — Build the Lakeflow pipeline
+
+Two paths. Pick **Path A** if you want a working pipeline in 5 minutes, or **Path B** if you want to feel the Alteryx-style drag-and-drop experience (recommended for the customer demo — this is where the "Designer ≈ Alteryx Designer" story lands).
+
+---
+
+### Path A — import the prebuilt SQL (fast)
 
 1. Import `01_dlt_lakeflow_pipeline.sql` into your workspace.
 2. **Workflows → Pipelines → Create pipeline**.
-3. Pick **Serverless**, choose a destination catalog + schema for the pipeline outputs (where silver/gold will land).
+3. Pick **Serverless**, choose a destination catalog + schema for pipeline outputs.
 4. Under **Source code → Notebook libraries**, point at `01_dlt_lakeflow_pipeline.sql`.
-5. Under **Advanced → Configuration**, add two keys (these tell the pipeline where to read the bronze tables you produced in step 1):
+5. Under **Advanced → Configuration**, add:
    - `bronze_catalog` → same value you used in the bronze widget
    - `bronze_schema`  → same value you used in the bronze widget
-6. Save.
-7. Click **"Open in Designer"** (top right of the pipeline detail page).
-8. You'll see the visual canvas — five boxes (one per materialized view), connected by arrows showing data flow. This is the equivalent of the Alteryx canvas.
+6. **Save** → **Start**.
+7. Click **"Open in Designer"** to see the 5-node canvas.
 
-### What's on the canvas — Alteryx mapping
+---
+
+### Path B — build it node-by-node in Designer UI (Alteryx-feel demo)
+
+This is the demo path. The customer rebuilds her Alteryx canvas one box at a time. ~15 min walkthrough.
+
+**Create an empty pipeline first:**
+
+1. **Workflows → Pipelines → Create pipeline → Empty pipeline**.
+2. Pick **Serverless**, destination catalog + schema for the pipeline outputs.
+3. Save with name `lora_network_analytics` (or whatever).
+4. Click **"Open in Designer"**. You'll land on an empty canvas.
+
+**Now add the 5 nodes — each maps 1:1 to one Alteryx tool:**
+
+#### Node 1 — `sites_silver`  (≈ Alteryx Formula tool)
+
+1. On the canvas, click **+ Add → From dataset / Source**.
+2. Browse to `<bronze_catalog>.<bronze_schema>.sites_bronze` → select.
+3. With the new node selected, click **+ Add downstream → Custom SQL transformation** (or **Project / Formula** node if you prefer the visual builder).
+4. Name the output **`sites_silver`**.
+5. Paste this SQL (it's the COALESCE formula from the Alteryx canvas):
+   ```sql
+   SELECT
+     site_id,
+     CAST(SITE_LATITUDE  AS DOUBLE) AS SITE_LATITUDE,
+     CAST(SITE_LONGITUDE AS DOUBLE) AS SITE_LONGITUDE,
+     CAST(SITE_LATITUDE  AS DOUBLE) AS S_SITE_LATITUDE,
+     CAST(SITE_LONGITUDE AS DOUBLE) AS S_SITE_LONGITUDE
+   FROM sites_bronze
+   WHERE SITE_LATITUDE IS NOT NULL AND SITE_LONGITUDE IS NOT NULL
+   ```
+6. Click **Sample** in the right pane to see ~100 rows of output — same as the Alteryx data viewer.
+
+#### Node 2 — `markets_silver`  (≈ Alteryx Input Data MapInfo TAB)
+
+1. **+ Add → From dataset / Source** on the canvas.
+2. Browse to `<bronze_catalog>.<bronze_schema>.county_markets_bronze` → select.
+3. **+ Add downstream → Custom SQL transformation**, output name **`markets_silver`**.
+4. Paste:
+   ```sql
+   SELECT
+     ID                  AS market_id,
+     Name                AS market_name,
+     State               AS state,
+     MarketType          AS market_type,
+     MarketTypeDetailed  AS market_type_detailed,
+     Population          AS population,
+     geometry_wkt
+   FROM county_markets_bronze
+   WHERE geometry_wkt IS NOT NULL
+   ```
+
+You now have two parallel branches on the canvas — sites on one side, markets on the other. Exactly like the Alteryx layout.
+
+#### Node 3 — `sites_in_market`  (≈ Alteryx Spatial Match → "Target within Universe")
+
+This is the point-in-polygon join — the centerpiece of the workflow.
+
+1. With `sites_silver` selected, click **+ Add downstream → Join** (or **Custom SQL** if you want the join condition explicit).
+2. Set the other input to **`markets_silver`**.
+3. For **Join type**, pick **Inner join**.
+4. For the **Join condition**, switch to **Custom condition** and paste:
+   ```sql
+   ST_Contains(
+     ST_GeomFromWKT(markets_silver.geometry_wkt),
+     ST_Point(sites_silver.S_SITE_LONGITUDE, sites_silver.S_SITE_LATITUDE)
+   )
+   ```
+5. Name the output **`sites_in_market`**. Choose the columns you want to keep:
+   - From `sites_silver`: `site_id`, `S_SITE_LATITUDE`, `S_SITE_LONGITUDE`
+   - From `markets_silver`: `market_id`, `market_name`, `state`, `market_type_detailed`, `population`
+6. **Sample** — you should see ~1,000 rows for the demo dataset (one row per site that's inside a polygon).
+
+#### Node 4 — `sites_nearest_market`  (≈ Alteryx Find Nearest)
+
+This one needs a custom SQL block because window functions over `ST_DistanceSphere` aren't expressible with a single visual node.
+
+1. **+ Add → Custom SQL transformation** anywhere on the canvas (it can read from any other node — Designer will draw the arrows for you).
+2. Output name **`sites_nearest_market`**.
+3. Paste:
+   ```sql
+   WITH unmatched AS (
+     SELECT s.*
+     FROM sites_silver s
+     LEFT ANTI JOIN sites_in_market m USING (site_id)
+   ),
+   ranked AS (
+     SELECT
+       u.site_id,
+       u.S_SITE_LATITUDE,
+       u.S_SITE_LONGITUDE,
+       m.market_id,
+       m.market_name,
+       m.state,
+       m.market_type_detailed,
+       m.population,
+       ST_DistanceSphere(
+         ST_Point(u.S_SITE_LONGITUDE, u.S_SITE_LATITUDE),
+         ST_Centroid(ST_GeomFromWKT(m.geometry_wkt))
+       ) AS distance_m,
+       ROW_NUMBER() OVER (
+         PARTITION BY u.site_id
+         ORDER BY ST_DistanceSphere(
+           ST_Point(u.S_SITE_LONGITUDE, u.S_SITE_LATITUDE),
+           ST_Centroid(ST_GeomFromWKT(m.geometry_wkt))
+         )
+       ) AS rn
+     FROM unmatched u
+     CROSS JOIN markets_silver m
+   )
+   SELECT site_id, S_SITE_LATITUDE, S_SITE_LONGITUDE,
+          market_id, market_name, state, market_type_detailed, population,
+          ROUND(distance_m / 1000.0, 2) AS distance_km
+   FROM ranked
+   WHERE rn = 1
+   ```
+4. **Sample** — for the demo data this is empty (all sites fell inside a market). That's expected; the node exists to handle real-world inputs where some sites sit outside the Top-100 polygons.
+
+#### Node 5 — `site_market_enriched`  (≈ Alteryx Browse / final Output Data)
+
+1. **+ Add → Union** on the canvas (or **Custom SQL** with `UNION ALL`).
+2. Inputs: **`sites_in_market`** and **`sites_nearest_market`**.
+3. Add two computed columns so downstream consumers know how each row got matched:
+   - On the `sites_in_market` branch: `'WITHIN'` AS `match_type`, `0.0` AS `distance_km`
+   - On the `sites_nearest_market` branch: `'NEAREST'` AS `match_type`, `distance_km` (already exists)
+4. Output name **`site_market_enriched`**.
+
+If you prefer to write the union explicitly as Custom SQL:
+```sql
+SELECT site_id, S_SITE_LATITUDE, S_SITE_LONGITUDE,
+       market_id, market_name, state, market_type_detailed, population,
+       'WITHIN'  AS match_type,
+       0.0       AS distance_km
+FROM sites_in_market
+UNION ALL
+SELECT site_id, S_SITE_LATITUDE, S_SITE_LONGITUDE,
+       market_id, market_name, state, market_type_detailed, population,
+       'NEAREST' AS match_type,
+       distance_km
+FROM sites_nearest_market
+```
+
+**Validate and run:**
+
+1. Click **Validate** (top of canvas) — Designer checks the SQL of every node and shows any errors inline.
+2. Click **Start** to run the pipeline once. Watch each node turn green as it materializes.
+3. Open the **Lineage** tab to see the column-level lineage Designer built automatically.
+
+You now have a working 5-node pipeline you built entirely in the UI — same logic as her Alteryx workflow, same canvas-style editing.
+
+### Alteryx ↔ Designer mapping reference
 
 | Designer node | Alteryx tool | What it does |
 |---|---|---|
@@ -85,7 +241,7 @@ Expected runtime: ~2 min. After this, the bronze layer is ready for any number o
 | `sites_nearest_market` | **Find Nearest** | `ST_DistanceSphere` + `ROW_NUMBER()` over centroid distances; fires only for sites with no containing polygon |
 | `site_market_enriched` | **Browse / Output Data** | Gold table that unions WITHIN-matches and NEAREST-matches with a `match_type` tag |
 
-Click any node to see its SQL on the right pane — that's the equivalent of double-clicking an Alteryx tool to edit its config.
+Click any node to see its SQL on the right pane — equivalent of double-clicking an Alteryx tool to edit its config.
 
 ---
 
